@@ -1,0 +1,186 @@
+#!/bin/sh
+#
+# scubabjs@gmail.com
+# 3/31/2022
+#
+#
+WORK=/home/scubabjs/work/encrypt-root/
+BIN=/home/scubabjs/bin
+LOG=$WORK/log
+#
+touch $LOG/snapshots.txt
+touch $LOG/encryptedvolumes.txt
+#
+# Control How much screen output is provided.
+#
+pause='1'
+verbose='1'
+debug='1'
+#
+host=$1
+voltype='gp2'
+state='pending'
+period='15'
+waittime='0'
+#
+#
+if [[ "$1" == "" ]] || [[ $# -gt 2 ]]; then
+ echo "USAGE: $0  <hostname> [filesystem]"
+ exit 1
+fi
+#
+vaildhost=`$BIN/awslookup $host hostname`
+if [[ $vaildhost != $host ]]; then
+  echo "ERROR: $host is not a vaild/existing hostname in the database."
+  exit 1
+fi
+#
+# Allow overide of the filesystem setting.
+#
+if [[ $2 == "" ]]; then
+#
+# Marklogic nodes have a different labled root volume.
+#
+  if [[ $host == *"mle"* ]] || [[ $host == *"mld"* ]]; then
+     fs='xvda'
+     echo "Setting filesystem setting to $fs"
+  else
+     fs='sda1'
+  fi
+else
+  fs=$2
+  echo "Overiding filesystem setting to $fs"
+fi
+#
+profile=`$BIN/awslookup $1 profile`
+instance=`$BIN/awslookup $1 instance`
+name=`$BIN/awslookup $1 name`
+az=`$BIN/awslookup $1 az`
+#
+if [[ $debug == '1' ]]; then
+ echo
+ echo $fs,$host,$profile,$instance,$az
+ echo
+fi
+#
+volume=`/usr/local/bin/aws ec2 describe-volumes --output=text --profile=$profile --filters Name=attachment.instance-id,Values=$instance --query 'Volumes[*].[Attachments[0].InstanceId,Attachments[0].VolumeId,Attachments[0].State,Size,Attachments[0].Device]' | grep $fs | awk '{print $2}'`
+#
+if [[ $debug == '1' ]]; then
+ echo
+ echo $fs,$host,$profile,$instance,$az,$volume
+ echo
+fi
+#
+snapshot=`/usr/local/bin/aws ec2 create-snapshot --profile=$profile --volume-id $volume --description "$host,$volume,$fs"  | tee -a $LOG/snapshots.txt | awk -F\" '/snap-/{print $4}'`
+#
+if [[ $debug == '1' ]]; then
+ echo
+ echo $fs,$host,$profile,$instance,$az,$volume,$snapshot
+ echo
+fi
+#
+state='creating'
+waittime='0'
+while [ "$state" != "completed" ]
+do
+  echo "Snapshot creation....($waittime's)..$state"
+  sleep $period
+  state=`/usr/local/bin/aws ec2 describe-snapshots --profile=$profile --snapshot-ids $snapshot | awk -F\" '/State/{print $4}'`
+  waittime=$(($waittime+$period))
+done
+if [[ $verbose == '1' ]]; then
+ /usr/local/bin/aws ec2 describe-snapshots --profile=$profile --snapshot-ids $snapshot
+else
+  echo "Snapshot creation....($waittime's)..$state"
+fi
+#
+evolume=`/usr/local/bin/aws ec2 create-volume --encrypted --profile $profile --volume-type $voltype --snapshot-id $snapshot --availability-zone $az --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=$name-ec2},{Key=rootvol,Value=encrypted}]" | tee -a $LOG/encryptedvolumes.txt | awk -F\" '/vol-/{print $4}'`
+#
+if [[ $debug == '1' ]]; then
+ echo
+ echo $fs,$host,$profile,$instance,$az,$volume,$snapshot,$evolume
+ echo
+fi
+#
+state='creating'
+waittime='0'
+while [ "$state" != "available" ]
+do
+  echo "Volume creation....($waittime's)..$state"
+  sleep $period
+  state=`/usr/local/bin/aws ec2 describe-volumes --profile=$profile --volume-ids $evolume | awk -F\" '/State/{print $4}'`
+  waittime=$(($waittime+$period))
+done
+if [[ $verbose == '1' ]]; then
+ /usr/local/bin/aws ec2 describe-volumes --profile=$profile --volume-ids $evolume
+else
+  echo "Volume creation....($waittime's)..$state"
+fi
+#
+# Apply Tags from original Volume to new Encrypted Volume.
+#
+tag_list=`/usr/local/bin/aws ec2 describe-tags --profile $profile --output text --filters "Name=resource-id,Values=$volume" | awk '{print "Key="$2",Value="$5}'`
+/usr/local/bin/aws ec2 create-tags --profile $profile --resources $evolume --tags $tag_list
+#
+if [[ $verbose == '1' ]]; then
+  echo "Tags copied to Encrypted Volume: $evolume"
+  /usr/local/bin/aws ec2 describe-tags --profile $profile --output text --filters "Name=resource-id,Values=$evolume" | awk '{print "Key="$2",Value="$5}'
+fi
+#
+# DANGER DANGER DANGER....... Do not uncomment unless you mean it!
+#
+
+if [[ $pause == '1' ]]; then
+echo ".......................   DANGER DANGER DANGER ..................... "
+echo "You are about to stop an instance, please be sure you wish to procede."
+read -rsp $'Press any key to continue or Ctrl+C to exit \n' -n1 key
+fi
+#
+reboot=`/usr/local/bin/aws ec2 stop-instances --profile $profile --instance-id $instance | awk -F\" '/InstanceId/{print $4}'`
+state='running'
+waittime='0'
+while [ "$state" != "stopped" ]
+do
+  echo "Stopping $host.....($waittime's).....$state"
+  sleep $period
+  state=`/usr/local/bin/aws ec2 describe-instances --profile $profile --instance-id $instance --output text --query "Reservations[*].Instances[*].[State.Name]"`
+  waittime=$(($waittime+$period))
+done
+echo "Stopping $host.....($waittime's).....$state"
+#
+sleep 5
+#
+if [[ $verbose == '1' ]]; then
+  /usr/local/bin/aws ec2 detach-volume --profile $profile --instance-id $instance --volume-id $volume
+else
+  state=`/usr/local/bin/aws ec2 detach-volume --profile $profile --instance-id $instance --volume-id $volume | awk -F\" '/State/{print $4}'`
+  echo $volume $state from $instance
+fi
+#/usr/local/bin/aws ec2 describe-volume-status --profile $profile --volume-id $volume
+#
+sleep 5
+#
+if [[ $verbose == '1' ]]; then
+  /usr/local/bin/aws ec2 attach-volume --profile $profile --instance-id $instance --volume-id $evolume --device /dev/$fs
+else
+  state=`/usr/local/bin/aws ec2 attach-volume --profile $profile --instance-id $instance --volume-id $evolume --device /dev/$fs | awk -F\" '/State/{print $4}'`
+  echo $evolume $state to $instance
+fi
+#/usr/local/bin/aws ec2 describe-volume-status --profile $profile --volume-id $evolume
+#
+sleep 5
+#
+if [[ $verbose == '1' ]]; then
+  /usr/local/bin/aws ec2 start-instances --profile $profile --instance-id $instance
+else
+  reboot=`/usr/local/bin/aws ec2 start-instances --profile $profile --instance-id $instance  | awk -F\" '/InstanceId/{print $4}'`
+  echo "$host $reboot is restarting"
+fi
+#
+# A Terraform apply will set DeleteOnTermination properly... and it would make sense to check that performing this task
+#
+#if [[ $host == *"mle"* ]] || [[ $host == *"mld"* ]]; then
+#   /usr/local/bin/aws ec2 modify-instance-attribute --profile $profile --instance-id $instance --block-device-mappings "[{\"DeviceName\": \"/dev/xvda\",\"Ebs\":{\"DeleteOnTermination\":true}}]"
+#else
+#   /usr/local/bin/aws ec2 modify-instance-attribute --profile $profile --instance-id $instance --block-device-mappings "[{\"DeviceName\": \"/dev/sda1\",\"Ebs\":{\"DeleteOnTermination\":true}}]"
+#fi
